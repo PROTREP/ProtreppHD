@@ -1,0 +1,284 @@
+
+import express from "express";
+import axios from "axios";
+import crypto from "node:crypto";
+import os from "node:os";
+import path from "node:path";
+import fs from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import FormData from "form-data";
+import ffprobeStatic from "ffprobe-static";
+
+const app = express();
+const execFileAsync = promisify(execFile);
+
+const PORT = process.env.PORT || 3000;
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const APP_SECRET = process.env.META_APP_SECRET;
+const ACCESS_TOKEN = process.env.WHATSAPP_TOKEN;
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const GRAPH_VERSION = process.env.GRAPH_API_VERSION || "v23.0";
+const GRAPH = `https://graph.facebook.com/${GRAPH_VERSION}`;
+
+app.use(express.json({
+  limit: "1mb",
+  verify: (req, res, buf) => {
+    req.rawBody = Buffer.from(buf);
+  }
+}));
+
+function signatureIsValid(req) {
+  if (!APP_SECRET || !req.rawBody) return false;
+
+  const received = req.get("x-hub-signature-256") || "";
+  const expected = "sha256=" + crypto
+    .createHmac("sha256", APP_SECRET)
+    .update(req.rawBody)
+    .digest("hex");
+
+  const a = Buffer.from(received);
+  const b = Buffer.from(expected);
+
+  return a.length === b.length &&
+    crypto.timingSafeEqual(a, b);
+}
+
+async function graphRequest(url, config = {}) {
+  if (!ACCESS_TOKEN) throw new Error("Missing WhatsApp token");
+
+  return axios({
+    url,
+    ...config,
+    headers: {
+      Authorization: `Bearer ${ACCESS_TOKEN}`,
+      ...(config.headers || {})
+    },
+    timeout: 60000,
+    maxContentLength: 20 * 1024 * 1024,
+    maxBodyLength: 20 * 1024 * 1024
+  });
+}
+
+async function sendText(to, body) {
+  return graphRequest(`${GRAPH}/${PHONE_NUMBER_ID}/messages`, {
+    method: "POST",
+    data: {
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to,
+      type: "text",
+      text: { body }
+    }
+  });
+}
+
+async function sendVideo(to, mediaId) {
+  return graphRequest(`${GRAPH}/${PHONE_NUMBER_ID}/messages`, {
+    method: "POST",
+    data: {
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to,
+      type: "video",
+      video: {
+        id: mediaId,
+        caption: "PROTREP HD | Video diproses tanpa pengekodan semula."
+      }
+    }
+  });
+}
+
+async function getMedia(mediaId) {
+  const response = await graphRequest(
+    `${GRAPH}/${mediaId}`,
+    { method: "GET" }
+  );
+
+  if (!response.data?.url) {
+    throw new Error("Meta did not return a media URL");
+  }
+
+  const media = await axios.get(response.data.url, {
+    responseType: "arraybuffer",
+    headers: { Authorization: `Bearer ${ACCESS_TOKEN}` },
+    timeout: 60000,
+    maxContentLength: 16 * 1024 * 1024
+  });
+
+  return {
+    buffer: Buffer.from(media.data),
+    mimeType: response.data.mime_type || "video/mp4"
+  };
+}
+
+async function inspectVideo(buffer, mimeType) {
+  const file = path.join(
+    os.tmpdir(),
+    `protrep-${crypto.randomUUID()}.mp4`
+  );
+
+  try {
+    await fs.writeFile(file, buffer);
+
+    const ffprobePath =
+      typeof ffprobeStatic === "string"
+        ? ffprobeStatic
+        : ffprobeStatic.path;
+
+    const { stdout } = await execFileAsync(ffprobePath, [
+      "-v", "error",
+      "-show_entries",
+      "format=duration,size,format_name:stream=codec_type,codec_name,width,height,avg_frame_rate,bit_rate",
+      "-of", "json",
+      file
+    ], { timeout: 15000, maxBuffer: 1024 * 1024 });
+
+    const data = JSON.parse(stdout);
+    const video = data.streams?.find(s => s.codec_type === "video");
+    const audio = data.streams?.find(s => s.codec_type === "audio");
+
+    if (!video) throw new Error("No video stream found");
+
+    const [num, den] = (video.avg_frame_rate || "0/1")
+      .split("/")
+      .map(Number);
+
+    return [
+      "📹 PROTREP HD — Laporan video",
+      `Resolusi: ${video.width || "?"} × ${video.height || "?"}`,
+      `FPS: ${den ? (num / den).toFixed(2) : "Tidak diketahui"}`,
+      `Codec video: ${video.codec_name || "Tidak diketahui"}`,
+      `Codec audio: ${audio?.codec_name || "Tiada / tidak diketahui"}`,
+      `Bitrate video: ${
+        video.bit_rate
+          ? Math.round(Number(video.bit_rate) / 1000) + " kbps"
+          : "Tidak tersedia"
+      }`,
+      `Saiz: ${(buffer.length / 1024 / 1024).toFixed(2)} MB`,
+      `Format sumber: ${data.format?.format_name || mimeType}`,
+      "",
+      "Nota: laporan ini membaca metadata. Bot tidak menambah resolusi atau FPS."
+    ].join("\n");
+  } finally {
+    await fs.unlink(file).catch(() => {});
+  }
+}
+
+async function uploadOriginal(buffer, mimeType) {
+  // Only pass through MP4 video. Never transcode a different format.
+  if (mimeType !== "video/mp4") {
+    throw new Error(
+      "Format ini tidak disokong untuk penghantaran semula tanpa pengekodan semula."
+    );
+  }
+
+  const form = new FormData();
+  form.append("messaging_product", "whatsapp");
+  form.append("type", "video/mp4");
+  form.append("file", buffer, {
+    filename: "protrep-original.mp4",
+    contentType: "video/mp4"
+  });
+
+  const response = await graphRequest(
+    `${GRAPH}/${PHONE_NUMBER_ID}/media`,
+    {
+      method: "POST",
+      data: form,
+      headers: form.getHeaders()
+    }
+  );
+
+  return response.data.id;
+}
+
+async function handleMessage(message) {
+  const from = message.from;
+
+  if (!from) return;
+
+  if (message.type !== "video") {
+    await sendText(
+      from,
+      "👋 Selamat datang ke PROTREP HD!\n\nHantar video MP4 sebagai video untuk membaca spesifikasi dan cuba menghantarnya semula tanpa pengekodan semula."
+    );
+    return;
+  }
+
+  await sendText(
+    from,
+    "⏳ PROTREP HD sedang memeriksa video kau. Tunggu sebentar ya."
+  );
+
+  try {
+    const mediaId = message.video?.id;
+    if (!mediaId) throw new Error("Missing media ID");
+
+    const { buffer, mimeType } = await getMedia(mediaId);
+
+    if (buffer.length > 16 * 1024 * 1024) {
+      throw new Error(
+        "Video melebihi had pemprosesan awal 16 MB. Fail belum diubah."
+      );
+    }
+
+    const report = await inspectVideo(buffer, mimeType);
+    await sendText(from, report);
+
+    const newMediaId = await uploadOriginal(buffer, mimeType);
+    await sendVideo(from, newMediaId);
+  } catch (error) {
+    console.error("Video processing failed:", error.message);
+
+    await sendText(
+      from,
+      "Maaf bro, bot belum dapat memulangkan video ini tanpa perubahan.\n\nSebab: " +
+      (error.message || "Ralat pemprosesan") +
+      "\n\nFail asal tidak ditukar kepada resolusi atau FPS yang lebih tinggi."
+    ).catch(() => {});
+  }
+}
+
+app.get("/", (req, res) => {
+  res.status(200).send("PROTREP HD bot is running.");
+});
+
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (
+    mode === "subscribe" &&
+    VERIFY_TOKEN &&
+    token === VERIFY_TOKEN
+  ) {
+    return res.status(200).send(challenge);
+  }
+
+  return res.sendStatus(403);
+});
+
+app.post("/webhook", (req, res) => {
+  if (!signatureIsValid(req)) return res.sendStatus(401);
+
+  // Acknowledge Meta promptly; process the message afterwards.
+  res.sendStatus(200);
+
+  if (req.body?.object !== "whatsapp_business_account") return;
+
+  for (const entry of req.body.entry || []) {
+    for (const change of entry.changes || []) {
+      for (const message of change.value?.messages || []) {
+        void handleMessage(message).catch(error => {
+          console.error("Message handler failed:", error.message);
+        });
+      }
+    }
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`PROTREP HD listening on port ${PORT}`);
+});
